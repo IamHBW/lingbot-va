@@ -1,8 +1,16 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import gc
+import json
 import os
+import platform
+import shutil
 import sys
+import traceback
+import uuid
+from importlib import metadata
 from pathlib import Path
+
 import wandb
 
 import torch
@@ -12,12 +20,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
-    get_optimizer_state_dict,
-    set_optimizer_state_dict,
     StateDictOptions,
 )
-from safetensors.torch import save_file, load_file
-import json
+from safetensors.torch import save_file
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,45 +49,92 @@ from utils import (
 )
 
 from dataset import MultiLatentLeRobotDataset
-import gc
+from utils.resume import (
+    CHECKPOINT_VERSION,
+    capture_runtime_state,
+    dataset_signature,
+    load_optimizer_state,
+    restore_runtime_state,
+    resume_data_iterator,
+    save_optimizer_state,
+    validate_checkpoint,
+)
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _dependency_versions():
+    versions = {"python": platform.python_version(), "torch": torch.__version__}
+    for package in ("numpy", "diffusers", "transformers", "lerobot", "safetensors"):
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
 
 
 class Trainer:
     def __init__(self, config):
+        self.step = 0
+        self.config = config
+        self.device = torch.device(f"cuda:{config.local_rank}")
+        self.dtype = config.param_dtype
+        self.patch_size = config.patch_size
+        self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+        self.resume_path = Path(config.resume_from) if getattr(config, "resume_from", None) else None
+
+        logger.info("Setting up datasets...")
+        self.train_dataset = MultiLatentLeRobotDataset(config=config)
+        self.data_generator = torch.Generator().manual_seed(42 + config.rank)
+        self.train_sampler = DistributedSampler(
+            self.train_dataset,
+            num_replicas=config.world_size,
+            rank=config.rank,
+            shuffle=True,
+            seed=42,
+        ) if config.world_size > 1 else None
+        self.data_signature = dataset_signature(self.train_dataset.dataset_manifest)
+        self.resume_trainer_state = None
+        self.resume_rank_state = None
+        if self.resume_path:
+            self.resume_trainer_state, self.resume_rank_state = validate_checkpoint(
+                self.resume_path,
+                self._training_topology(),
+                self.data_signature,
+                config.rank,
+            )
+
         if config.enable_wandb and config.rank == 0:
             wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
             self.wandb.init(
                 entity=os.environ["WANDB_TEAM_NAME"],
                 project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
                 config=config,
                 mode="online",
                 name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
             logger.info("WandB logging enabled")
-        self.step = 0
-        self.config = config
-        self.device = torch.device(f"cuda:{config.local_rank}")
-        self.dtype = config.param_dtype
-        self.patch_size = config.patch_size
 
-        # Load models
         logger.info("Loading models...")
-
-        # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
-
-        if hasattr(config, 'resume_from') and config.resume_from:
-            transformer_path = os.path.join(config.resume_from, 'transformer')
+        if self.resume_path:
+            transformer_path = self.resume_path / 'transformer'
             if config.rank == 0:
                 logger.info(f"Resuming from checkpoint: {transformer_path}")
         else:
-            transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
+            transformer_path = Path(config.wan22_pretrained_model_name_or_path) / 'transformer'
 
         self.transformer = load_transformer(
-            transformer_path,
+            str(transformer_path),
             torch_dtype=torch.float32,
             torch_device='cpu',
             attn_mode="flex"
@@ -103,7 +155,6 @@ class Trainer:
         self.transformer.train()
         self.transformer.requires_grad_(True)
 
-        # Optimizer
         self.optimizer = torch.optim.AdamW(
             [p for p in self.transformer.parameters() if p.requires_grad],
             lr=config.learning_rate,
@@ -117,22 +168,13 @@ class Trainer:
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
 
-        # Setup dataloaders
-        logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=config.world_size,
-            rank=config.rank,
-            shuffle=True,
-            seed=42
-        ) if config.world_size > 1 else None
         self.train_loader = DataLoader(
-            train_dataset,
+            self.train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
+            shuffle=(self.train_sampler is None),
             num_workers=config.load_worker,
-            sampler=train_sampler,
+            sampler=self.train_sampler,
+            generator=self.data_generator,
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -143,25 +185,52 @@ class Trainer:
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
+        self.data_epoch = 0
+        self.data_batch_offset = 0
+        self.data_epoch_generator_state = None
+        if self.resume_path:
+            self._load_training_state()
+
+    def _training_topology(self):
+        return {
+            "world_size": self.config.world_size,
+            "batch_size": self.config.batch_size,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "num_workers": self.config.load_worker,
+            "sampler": (
+                "DistributedSampler" if self.train_sampler is not None else "RandomSampler"
+            ),
+            "shuffle": True,
+            "sampler_seed": getattr(self.train_sampler, "seed", None),
+            "data_seed": 42,
+            "drop_last": False,
+            "pin_memory": False,
+            "persistent_workers": False,
+            "prefetch_factor": 2 if self.config.load_worker > 0 else None,
+            "timeout": 0,
+            "in_order": True,
+        }
+
+    def _start_data_epoch(self):
+        if hasattr(self.train_loader.sampler, 'set_epoch'):
+            self.train_loader.sampler.set_epoch(self.data_epoch)
+        self.data_epoch_generator_state = self.data_generator.get_state()
+        self.train_loader_iter = iter(self.train_loader)
     
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
         if self.train_loader_iter is None:
-            self.train_loader_iter = iter(self.train_loader)
+            self._start_data_epoch()
         
         try:
             batch = next(self.train_loader_iter)
         except StopIteration:
-            # Reset sampler and iterator when epoch finishes
-            if hasattr(self.train_loader.sampler, 'set_epoch'):
-                self.train_loader.sampler.set_epoch(self.train_loader.sampler.epoch + 1)
-            self.train_loader_iter = iter(self.train_loader)
+            self.data_epoch += 1
+            self.data_batch_offset = 0
+            self._start_data_epoch()
             batch = next(self.train_loader_iter)
-        
+        self.data_batch_offset += 1
         return batch
 
     @torch.no_grad()
@@ -328,94 +397,155 @@ class Trainer:
 
         return losses
 
-    def save_checkpoint(self,):
-        """Save model checkpoint in the same format as pretrained model."""
+    def _checkpoint_phase(self, name, action):
+        result = None
+        error = None
         try:
-            state_dict = get_model_state_dict(
-                self.transformer,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            result = action()
+        except Exception:
+            error = traceback.format_exc()
+        errors = [error]
+        if dist.is_initialized():
+            errors = [None] * self.config.world_size
+            dist.all_gather_object(errors, error)
+        errors = [item for item in errors if item]
+        if errors:
+            raise RuntimeError(f"checkpoint phase {name!r} failed:\n" + "\n".join(errors))
+        return result
+
+    def save_checkpoint(self):
+        """Atomically save all state needed for an exact restart."""
+        if self.data_epoch_generator_state is None:
+            raise RuntimeError("cannot checkpoint before the first data batch")
+
+        checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
+        temp_name = f".{checkpoint_dir.name}.tmp-{uuid.uuid4().hex}" if self.config.rank == 0 else None
+        if dist.is_initialized():
+            names = [temp_name]
+            dist.broadcast_object_list(names, src=0)
+            temp_name = names[0]
+        temp_dir = self.save_dir / temp_name
+        runtime_state = capture_runtime_state(
+            self.data_generator,
+            self.data_epoch_generator_state,
+            self.data_epoch,
+            self.data_batch_offset,
+            self.device,
+        )
+        runtime_state.update({
+            "format_version": CHECKPOINT_VERSION,
+            "rank": self.config.rank,
+            "world_size": self.config.world_size,
+            "global_step": self.step,
+        })
+
+        try:
+            def prepare_directory():
+                if self.config.rank == 0:
+                    if checkpoint_dir.exists():
+                        raise FileExistsError(f"checkpoint already exists: {checkpoint_dir}")
+                    (temp_dir / "transformer").mkdir(parents=True)
+
+            self._checkpoint_phase("prepare", prepare_directory)
+            state_dict = self._checkpoint_phase(
+                "collect model",
+                lambda: get_model_state_dict(
+                    self.transformer,
+                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                ),
             )
-            state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
 
-            # Only rank 0 saves the checkpoint
-            if self.config.rank == 0:
-                checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                # Save transformer in the same format as pretrained model
-                transformer_dir = checkpoint_dir / "transformer"
-                transformer_dir.mkdir(parents=True, exist_ok=True)
-
-                logger.info(f"Saving transformer to {transformer_dir}")
-
-                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
-                # Save model weights
-                model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
-                save_file(state_dict_bf16, model_file)
-
-                # Save config (copy from original transformer config and update _name_or_path)
-                config_file = transformer_dir / "config.json"
+            def save_transformer():
+                if self.config.rank != 0:
+                    return
+                save_file(
+                    state_dict,
+                    temp_dir / "transformer" / "diffusion_pytorch_model.safetensors",
+                )
                 config_dict = dict(self.transformer.config)
                 config_dict.pop('_name_or_path', None)
-                with open(config_file, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
+                with (temp_dir / "transformer" / "config.json").open("w", encoding="utf-8") as file:
+                    json.dump(_json_safe(config_dict), file, indent=2)
 
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
+            self._checkpoint_phase("save model", save_transformer)
+            del state_dict
+            self._checkpoint_phase(
+                "save optimizer",
+                lambda: save_optimizer_state(
+                    self.transformer, self.optimizer, temp_dir / "optimizer"
+                ),
+            )
 
-                logger.info(f"Checkpoint saved successfully at step {self.step}")
+            def save_metadata():
+                torch.save(runtime_state, temp_dir / f"rank_{self.config.rank}.pt")
+                if self.config.rank != 0:
+                    return
+                torch.save(
+                    {
+                        "format_version": CHECKPOINT_VERSION,
+                        "global_step": self.step,
+                        "scheduler_state_dict": self.lr_scheduler.state_dict(),
+                        "topology": self._training_topology(),
+                        "data_signature": self.data_signature,
+                    },
+                    temp_dir / "trainer_state.pt",
+                )
+                with (temp_dir / "training_config.json").open("w", encoding="utf-8") as file:
+                    json.dump(
+                        {
+                            "format_version": CHECKPOINT_VERSION,
+                            "config": _json_safe(dict(self.config)),
+                            "dependencies": _dependency_versions(),
+                            "datasets": self.train_dataset.dataset_manifest,
+                            "data_signature": self.data_signature,
+                        },
+                        file,
+                        indent=2,
+                    )
 
-            # Synchronize all processes after saving
+            self._checkpoint_phase("save metadata", save_metadata)
+            self._checkpoint_phase(
+                "commit",
+                lambda: os.replace(temp_dir, checkpoint_dir) if self.config.rank == 0 else None,
+            )
+        except Exception:
+            if self.config.rank == 0:
+                shutil.rmtree(temp_dir, ignore_errors=True)
             if dist.is_initialized():
                 dist.barrier()
-
-        except Exception as e:
-            if self.config.rank == 0:
-                logger.error(f"Failed to save checkpoint: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-            # Ensure all processes stay synchronized even on error
-            if dist.is_initialized():
-                dist.barrier()
-
-    def _load_training_state(self, checkpoint_path):
-        """Load training state (optimizer + step) after FSDP and optimizer creation."""
-        checkpoint_dir = Path(checkpoint_path)
-        training_state_path = checkpoint_dir / "training_state.pt"
-
-        if not training_state_path.exists():
-            if self.config.rank == 0:
-                logger.warning(f"Training state not found: {training_state_path}, starting from step 0")
-            return
+            raise
+        finally:
+            restore_runtime_state(runtime_state, self.data_generator, self.device)
 
         if self.config.rank == 0:
-            logger.info(f"Loading training state from {training_state_path}")
+            logger.info(f"Checkpoint saved successfully at step {self.step}: {checkpoint_dir}")
 
-        # All ranks load the training state directly
-        training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
+    def _load_training_state(self):
+        """Restore scheduler, sharded optimizer, data position, and per-rank RNG."""
+        if self.config.rank == 0:
+            logger.info(f"Loading training state from {self.resume_path}")
 
-        # All ranks load optimizer state (required for FSDP)
-        set_optimizer_state_dict(
-            self.transformer, self.optimizer,
-            optim_state_dict=training_state['optimizer_state_dict'],
-            options=StateDictOptions(full_state_dict=True, strict=False)
+        self.lr_scheduler.load_state_dict(
+            self.resume_trainer_state["scheduler_state_dict"]
         )
-        self.step = training_state.get('step', 0)
+        load_optimizer_state(
+            self.transformer, self.optimizer, self.resume_path / "optimizer"
+        )
+        self.step = self.resume_trainer_state["global_step"]
+        self.data_epoch = self.resume_rank_state["data_epoch"]
+        self.data_batch_offset = self.resume_rank_state["data_batch_offset"]
+        self.data_epoch_generator_state = self.resume_rank_state[
+            "data_epoch_generator_state"
+        ]
+        self.train_loader_iter = resume_data_iterator(
+            self.train_loader, self.data_generator, self.resume_rank_state
+        )
+        restore_runtime_state(
+            self.resume_rank_state, self.data_generator, self.device
+        )
 
         if self.config.rank == 0:
             logger.info(f"Training state loaded, resuming from step {self.step}")
-
-        # Synchronize all ranks
         if dist.is_initialized():
             dist.barrier()
 
@@ -519,6 +649,7 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    config.resume_from = args.resume_from
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -542,6 +673,12 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume from a complete checkpoint_step_N directory",
     )
 
     args = parser.parse_args()

@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import hashlib
+
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import get_episode_data_index
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
@@ -45,8 +47,10 @@ def construct_lerobot_multi_processor(config,
         construct_lerobot,
         config=config,
     )
-    repo_list = recursive_find_file(config.dataset_path, 'info.json')
-    repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
+    repo_list = sorted(
+        str(Path(path).parent.parent)
+        for path in recursive_find_file(config.dataset_path, 'info.json')
+    )
     with Pool(num_init_worker) as pool:
         datasets_out_lst = pool.map(construct_func, repo_list)
                 
@@ -76,6 +80,16 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
                                                            )
+        self.dataset_manifest = [
+            {
+                "repo_id": str(Path(dataset.repo_id).resolve()),
+                "length": len(dataset),
+                "info_sha256": hashlib.sha256(
+                    (Path(dataset.repo_id) / "meta" / "info.json").read_bytes()
+                ).hexdigest(),
+            }
+            for dataset in self._datasets
+        ]
         self.item_id_to_dataset_id, self.acc_dset_num = (
             self._get_item_id_to_dataset_id()
         )
