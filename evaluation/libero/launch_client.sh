@@ -4,6 +4,6 @@ END=10
 python evaluation/libero/client.py \
     --libero-benchmark libero_10 \
     --port 29056 \
-    --test-num 50 \
+    --test-num 1 \
     --task-range $START $END \
     --out-dir outputs/libero

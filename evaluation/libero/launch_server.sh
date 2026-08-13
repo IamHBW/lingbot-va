@@ -1,6 +1,7 @@
+model_path=${1:?Usage: $0 MODEL_PATH [SAVE_ROOT]}
 
-save_root='visualization/'
-mkdir -p $save_root
+save_root=${2:-visualization/}
+mkdir -p "$save_root"
 
 python -m torch.distributed.run \
     --nproc_per_node 1 \
@@ -8,4 +9,5 @@ python -m torch.distributed.run \
     wan_va/wan_va_server.py \
     --config-name libero \
     --port 29056 \
-    --save_root $save_root
+    --model-path "$model_path" \
+    --save_root "$save_root"

@@ -1,8 +1,9 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import hashlib
 import os
 import sys
-import time
+from datetime import datetime
 from functools import partial
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
@@ -44,6 +45,7 @@ class VA_Server:
         self.cache_name = 'pos'
         self.job_config = job_config
         self.save_root = job_config.save_root
+        self.save_debug = getattr(job_config, "save_debug", False)
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
@@ -435,9 +437,14 @@ class VA_Server:
                 dtype=self.dtype,
             )
 
-        self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
-        self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
-        os.makedirs(self.exp_save_root, exist_ok=True)
+        self.exp_save_root = None
+        if self.save_debug:
+            prompt_hash = hashlib.sha256((prompt or "").encode()).hexdigest()[:12]
+            self.exp_name = (
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{prompt_hash}"
+            )
+            self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
+            os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
     def _infer(self, obs, frame_st_id=0):
@@ -562,8 +569,9 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        if self.save_debug:
+            save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+            save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
@@ -572,7 +580,8 @@ class VA_Server:
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        if self.save_debug:
+            save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
@@ -680,6 +689,8 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    config.save_debug = args.save_debug
+    config.wan22_pretrained_model_name_or_path = os.path.abspath(args.model_path)
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -716,10 +727,21 @@ def main():
         help='(start) port'
     )
     parser.add_argument(
+        "--model-path",
+        type=str,
+        required=True,
+        help="Checkpoint root containing vae, tokenizer, text_encoder, and transformer.",
+    )
+    parser.add_argument(
         "--save_root",
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--save-debug",
+        action="store_true",
+        help="Persist latent, action, and observation tensors for debugging.",
     )
     args = parser.parse_args()
     run(args)
