@@ -48,7 +48,7 @@ from utils import (
     FlowMatchScheduler
 )
 
-from dataset import MultiLatentLeRobotDataset
+from dataset import build_train_dataset
 from utils.resume import (
     CHECKPOINT_VERSION,
     capture_runtime_state,
@@ -81,6 +81,52 @@ def _dependency_versions():
     return versions
 
 
+def resolve_batch_configuration(
+    global_batch_size,
+    world_size,
+    batch_size,
+    gradient_accumulation_steps,
+):
+    world_size = int(world_size)
+    batch_size = int(batch_size)
+    if world_size <= 0 or batch_size <= 0:
+        raise ValueError("world_size and batch_size must be positive")
+    per_micro_step = world_size * batch_size
+    if global_batch_size is None:
+        accumulation = int(gradient_accumulation_steps or 1)
+        if accumulation <= 0:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        return per_micro_step * accumulation, accumulation
+
+    global_batch_size = int(global_batch_size)
+    if global_batch_size <= 0 or global_batch_size % per_micro_step:
+        raise ValueError(
+            f"global_batch_size={global_batch_size} must be a positive multiple "
+            f"of world_size={world_size} * batch_size={batch_size}"
+        )
+    accumulation = global_batch_size // per_micro_step
+    if (
+        gradient_accumulation_steps is not None
+        and int(gradient_accumulation_steps) != accumulation
+    ):
+        raise ValueError(
+            "gradient_accumulation_steps conflicts with global_batch_size: "
+            f"configured={gradient_accumulation_steps}, required={accumulation}"
+        )
+    return global_batch_size, accumulation
+
+
+def _require_finite_across_ranks(name, values):
+    finite = torch.isfinite(values.detach()).all().to(dtype=torch.int32)
+    if dist.is_initialized():
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not finite.item():
+        raise FloatingPointError(
+            f"Non-finite {name} detected on at least one rank; "
+            f"local values={values.detach().float().cpu().tolist()}"
+        )
+
+
 class Trainer:
     def __init__(self, config):
         self.step = 0
@@ -92,7 +138,7 @@ class Trainer:
         self.resume_path = Path(config.resume_from) if getattr(config, "resume_from", None) else None
 
         logger.info("Setting up datasets...")
-        self.train_dataset = MultiLatentLeRobotDataset(config=config)
+        self.train_dataset = build_train_dataset(config=config)
         self.data_generator = torch.Generator().manual_seed(42 + config.rank)
         self.train_sampler = DistributedSampler(
             self.train_dataset,
@@ -120,7 +166,8 @@ class Trainer:
                 project=os.getenv("WANDB_PROJECT", "va_robotwin"),
                 config=config,
                 mode="online",
-                name='test_lln'
+                name=os.getenv("WANDB_NAME"),
+                id=os.getenv("WANDB_RUN_ID"),
             )
             logger.info("WandB logging enabled")
 
@@ -379,6 +426,10 @@ class Trainer:
         latent_loss, action_loss = self.compute_loss(input_dict, output)
         loss = latent_loss + action_loss
 
+        _require_finite_across_ranks(
+            "loss", torch.stack((latent_loss, action_loss, loss))
+        )
+
         loss.backward()
 
         losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
@@ -386,6 +437,7 @@ class Trainer:
         # Only update weights after accumulating gradients
         if should_sync:
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
+            _require_finite_across_ranks("gradient norm", total_norm)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
@@ -581,6 +633,7 @@ class Trainer:
 
             # Log and checkpoint when optimizer steps
             if losses['should_log']:
+                self.step += 1
                 lr = self.lr_scheduler.get_last_lr()[0]
 
                 # Average accumulated losses
@@ -601,7 +654,7 @@ class Trainer:
 
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
-                    progress_bar.n += 1
+                    progress_bar.update(1)
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
@@ -618,8 +671,6 @@ class Trainer:
                             'grad_norm': total_norm.item(),
                             'lr': lr,
                         }, step=self.step)
-                
-                self.step += 1
                 
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
@@ -646,6 +697,15 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    (
+        config.global_batch_size,
+        config.gradient_accumulation_steps,
+    ) = resolve_batch_configuration(
+        getattr(config, "global_batch_size", None),
+        world_size,
+        config.batch_size,
+        getattr(config, "gradient_accumulation_steps", None),
+    )
 
     if args.save_root is not None:
         config.save_root = args.save_root
@@ -654,6 +714,12 @@ def run(args):
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
+        logger.info(
+            "Batch configuration: "
+            f"global={config.global_batch_size}, "
+            f"per_device={config.batch_size}, "
+            f"gradient_accumulation={config.gradient_accumulation_steps}"
+        )
 
     trainer = Trainer(config)
     trainer.train()
