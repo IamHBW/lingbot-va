@@ -62,7 +62,7 @@ va_robotwin_clean_train_cfg.global_batch_size = int(
     os.getenv("GLOBAL_BATCH_SIZE", "32")
 )
 va_robotwin_clean_train_cfg.gradient_accumulation_steps = int(
-    os.getenv("GRADIENT_ACCUMULATION_STEPS", "4")
+    os.getenv("GRADIENT_ACCUMULATION_STEPS", "1")
 )
 va_robotwin_clean_train_cfg.num_steps = int(
     os.getenv("NUM_STEPS", "30000")

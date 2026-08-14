@@ -117,13 +117,16 @@ def resolve_batch_configuration(
 
 
 def _require_finite_across_ranks(name, values):
-    finite = torch.isfinite(values.detach()).all().to(dtype=torch.int32)
+    local_values = values.detach()
+    if hasattr(local_values, "to_local"):
+        local_values = local_values.to_local()
+    finite = torch.isfinite(local_values).all().to(dtype=torch.int32)
     if dist.is_initialized():
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
     if not finite.item():
         raise FloatingPointError(
             f"Non-finite {name} detected on at least one rank; "
-            f"local values={values.detach().float().cpu().tolist()}"
+            f"local values={local_values.float().cpu().tolist()}"
         )
 
 

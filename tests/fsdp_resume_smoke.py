@@ -24,6 +24,7 @@ from wan_va.utils.resume import (
     resume_data_iterator,
     save_optimizer_state,
 )
+from wan_va.train import _require_finite_across_ranks
 
 
 class RandomDataset(Dataset):
@@ -53,6 +54,8 @@ def make_loader(rank, world_size, generator):
 def train_step(model, optimizer, scheduler, batch, device):
     optimizer.zero_grad()
     model(batch.to(device)).sum().backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9)
+    _require_finite_across_ranks("gradient norm", grad_norm)
     optimizer.step()
     scheduler.step()
 

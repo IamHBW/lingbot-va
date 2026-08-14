@@ -86,6 +86,7 @@ class RoboTwinCleanTrainTest(unittest.TestCase):
 
     def test_global_batch_32_and_conflicts(self):
         self.assertEqual(resolve_batch_configuration(32, 8, 1, 4), (32, 4))
+        self.assertEqual(resolve_batch_configuration(32, 32, 1, 1), (32, 1))
         with self.assertRaisesRegex(ValueError, "conflicts"):
             resolve_batch_configuration(32, 8, 1, 8)
         with self.assertRaisesRegex(ValueError, "positive multiple"):
@@ -95,6 +96,11 @@ class RoboTwinCleanTrainTest(unittest.TestCase):
         _require_finite_across_ranks("loss", torch.tensor(1.0))
         with self.assertRaisesRegex(FloatingPointError, "Non-finite loss"):
             _require_finite_across_ranks("loss", torch.tensor(float("nan")))
+
+        fake_dtensor = mock.Mock()
+        fake_dtensor.detach.return_value = fake_dtensor
+        fake_dtensor.to_local.return_value = torch.tensor(1.0)
+        _require_finite_across_ranks("gradient norm", fake_dtensor)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,43 @@ umask 007
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
+export NNODES=4
+export NGPU=8
+export TOTAL_GPUS=$((NNODES * NGPU))
+if [[ -n "${PET_NNODES:-}" ]] && [[ "${PET_NNODES}" != "${NNODES}" ]]; then
+    echo "Expected PET_NNODES=${NNODES}, got ${PET_NNODES}" >&2
+    exit 1
+fi
+export NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-}}"
+if [[ -z "${NODE_RANK}" ]]; then
+    if [[ "${HOSTNAME:-}" =~ -master-([0-9]+)$ ]]; then
+        NODE_RANK="${BASH_REMATCH[1]}"
+    elif [[ "${HOSTNAME:-}" =~ -worker-([0-9]+)$ ]]; then
+        NODE_RANK="$((BASH_REMATCH[1] + 1))"
+    else
+        echo "Cannot infer NODE_RANK from scheduler environment" >&2
+        exit 1
+    fi
+    export NODE_RANK
+fi
+export MASTER_ADDR="${PET_MASTER_ADDR:-${MASTER_ADDR:-}}"
+if [[ -z "${MASTER_ADDR}" ]]; then
+    if [[ "${HOSTNAME:-}" =~ -worker-[0-9]+$ ]]; then
+        MASTER_ADDR="${HOSTNAME%-worker-*}-master-0"
+    elif [[ "${HOSTNAME:-}" =~ -master-[0-9]+$ ]]; then
+        MASTER_ADDR="${HOSTNAME%-master-*}-master-0"
+    else
+        echo "Cannot infer MASTER_ADDR from scheduler environment" >&2
+        exit 1
+    fi
+    export MASTER_ADDR
+fi
+export MASTER_PORT="${PET_MASTER_PORT:-${MASTER_PORT:-29501}}"
+if [[ ! "${NODE_RANK}" =~ ^[0-9]+$ ]] || ((NODE_RANK >= NNODES)); then
+    echo "Invalid NODE_RANK=${NODE_RANK} for NNODES=${NNODES}" >&2
+    exit 1
+fi
+
 export TMPDIR="/mnt/data/users/bowen/workspace/tmp/lingbot-va"
 mkdir -p "${TMPDIR}"
 
@@ -14,15 +51,16 @@ source /mnt/data/public_tools/miniconda3/etc/profile.d/conda.sh
 conda activate lingbot-va
 source /mnt/data/users/bowen/workspace/tokens.sh
 
+export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
+export WANDB_TEAM_NAME="${WANDB_TEAM_NAME:-${WANDB_ENTITY:-}}"
 : "${WANDB_API_KEY:?WANDB_API_KEY is missing from bowen/workspace/tokens.sh}"
 : "${WANDB_BASE_URL:?WANDB_BASE_URL is missing from bowen/workspace/tokens.sh}"
-: "${WANDB_TEAM_NAME:?WANDB_TEAM_NAME is missing from bowen/workspace/tokens.sh}"
+: "${WANDB_TEAM_NAME:?WANDB_ENTITY is missing from bowen/workspace/tokens.sh}"
 
 export RUN_PRECOMPUTE=0
-export NGPU=8
 export GLOBAL_BATCH_SIZE=32
 export PER_DEVICE_BATCH_SIZE=1
-export GRADIENT_ACCUMULATION_STEPS=4
+export GRADIENT_ACCUMULATION_STEPS=1
 export LOAD_WORKER="${LOAD_WORKER:-16}"
 export ROBOTWIN_ROOT="/mnt/data/public_data/robotwin"
 export ROBOTWIN_DESCRIPTION_ROOT="/mnt/data/users/tianyu/workspace/code/RoboTwin/description"
@@ -52,17 +90,21 @@ RUN_NAME="${ROBOTWIN_RUN_NAME:-robotwin-gb32-${RUN_STAMP}}"
 RUN_ID="${ROBOTWIN_RUN_ID:-robotwin-gb32-${RUN_STAMP}}"
 SAVE_ROOT="${SAVE_ROOT:-/mnt/data/users/bowen/workspace/outputs/lingbot-va/${RUN_NAME}}"
 export RUN_NAME RUN_ID SAVE_ROOT
+export TORCHINDUCTOR_CACHE_DIR="/tmp/bowen/torchinductor/${RUN_ID}/node-${NODE_RANK}"
+mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 mkdir -p "${SAVE_ROOT}/logs" "${SAVE_ROOT}/wandb"
 export WANDB_DIR="${SAVE_ROOT}/wandb"
 
 echo "RUN_NAME=${RUN_NAME}"
 echo "SAVE_ROOT=${SAVE_ROOT}"
+echo "TOPOLOGY=${NNODES}x${NGPU} world_size=${TOTAL_GPUS} global_batch=${GLOBAL_BATCH_SIZE} accumulation=${GRADIENT_ACCUMULATION_STEPS} node_rank=${NODE_RANK} master=${MASTER_ADDR}:${MASTER_PORT}"
 
-if [[ -z "${HTRAIN_JOB_ID:-}" ]] && command -v submit >/dev/null 2>&1; then
+if ((NODE_RANK == 0)) && [[ -z "${HTRAIN_JOB_ID:-}" ]] && command -v submit >/dev/null 2>&1; then
     HTRAIN_JOB_ID="$(submit --status "${HTRAIN_JOB_NAME:-}" 2>/dev/null | awk '/^id:/ {print $2; exit}' || true)"
     export HTRAIN_JOB_ID
 fi
 
+if ((NODE_RANK == 0)); then
 python - <<'PY'
 import hashlib
 import importlib.metadata
@@ -201,9 +243,9 @@ manifest = {
         "type": "post-training",
         "dataset": "RoboTwin demo_clean/seen clean50",
         "global_batch_size": 32,
-        "world_size": 8,
+        "world_size": int(os.environ["TOTAL_GPUS"]),
         "per_device_batch_size": 1,
-        "gradient_accumulation_steps": 4,
+        "gradient_accumulation_steps": 1,
         "optimizer_steps": 30000,
         "checkpoint_interval": 1000,
         "precompute_ran": False,
@@ -256,6 +298,7 @@ manifest = {
     "dependencies": dependencies,
     "runtime": {
         "tmpdir": os.environ["TMPDIR"],
+        "torchinductor_cache_dir": os.environ["TORCHINDUCTOR_CACHE_DIR"],
         "torch_cuda": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
         "gpus": gpu_info,
@@ -264,7 +307,6 @@ manifest = {
         "entity": os.environ["WANDB_TEAM_NAME"],
         "project": os.environ["WANDB_PROJECT"],
         "run_name": os.environ["RUN_NAME"],
-        "smoke_id": os.environ["RUN_ID"] + "-smoke",
         "train_id": os.environ["RUN_ID"] + "-train",
         "mode": "online",
     },
@@ -272,8 +314,8 @@ manifest = {
         "job_name": os.getenv("HTRAIN_JOB_NAME"),
         "job_id": os.getenv("HTRAIN_JOB_ID") or os.getenv("JOB_ID"),
         "project": os.getenv("HTRAIN_PROJECT"),
-        "nodes": 1,
-        "gpus_per_node": 8,
+        "nodes": int(os.environ["NNODES"]),
+        "gpus_per_node": int(os.environ["NGPU"]),
     },
 }
 path = Path(os.environ["SAVE_ROOT"]) / "run_manifest.json"
@@ -282,19 +324,28 @@ temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 temporary.replace(path)
 print(f"Preflight passed; manifest written to {path}")
 PY
+fi
 
 run_training() {
     local output_root="$1"
     local log_file="$2"
-    python -m torch.distributed.run \
-        --standalone \
-        --nproc_per_node=8 \
-        --local-ranks-filter=0 \
-        --master-port="${MASTER_PORT:-29501}" \
-        --tee=3 \
-        -m wan_va.train \
-        --config-name=robotwin_clean_train \
-        --save-root="${output_root}" 2>&1 | tee "${log_file}"
+    local command=(
+        python -m torch.distributed.run
+        --nnodes="${NNODES}"
+        --nproc_per_node="${NGPU}"
+        --node_rank="${NODE_RANK}"
+        --master_addr="${MASTER_ADDR}"
+        --master_port="${MASTER_PORT}"
+        --tee=3
+        -m wan_va.train
+        --config-name=robotwin_clean_train
+        --save-root="${output_root}"
+    )
+    if ((NODE_RANK == 0)); then
+        "${command[@]}" 2>&1 | tee "${log_file}"
+    else
+        "${command[@]}" 2>&1 | tee "${log_file%.log}-node-${NODE_RANK}.log"
+    fi
 }
 
 verify_checkpoint() {
@@ -333,19 +384,12 @@ print(f"Strict checkpoint load passed: {checkpoint}")
 PY
 }
 
-export NUM_STEPS=11
-export SAVE_INTERVAL=11
-export WANDB_NAME="${RUN_NAME}-smoke"
-export WANDB_RUN_ID="${RUN_ID}-smoke"
-run_training "${SAVE_ROOT}/smoke" "${SAVE_ROOT}/logs/smoke.log"
-verify_checkpoint "${SAVE_ROOT}/smoke/checkpoints/checkpoint_step_11" \
-    2>&1 | tee "${SAVE_ROOT}/logs/smoke-checkpoint-load.log"
-
 export NUM_STEPS=30000
 export SAVE_INTERVAL=1000
 export WANDB_NAME="${RUN_NAME}"
 export WANDB_RUN_ID="${RUN_ID}-train"
 run_training "${SAVE_ROOT}/train" "${SAVE_ROOT}/logs/train.log"
+if ((NODE_RANK == 0)); then
 verify_checkpoint "${SAVE_ROOT}/train/checkpoints/checkpoint_step_30000" \
     2>&1 | tee "${SAVE_ROOT}/logs/final-checkpoint-load.log"
 
@@ -365,3 +409,4 @@ manifest["final_checkpoint"] = str(
 )
 path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 PY
+fi
