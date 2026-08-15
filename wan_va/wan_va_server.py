@@ -689,6 +689,8 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.host is not None:
+        config.host = args.host
     config.save_debug = args.save_debug
     config.wan22_pretrained_model_name_or_path = os.path.abspath(args.model_path)
     rank = int(os.getenv("RANK", 0))
@@ -719,6 +721,12 @@ def main():
         required=False,
         default='robotwin',
         help="config name.",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help='server bind host',
     )
     parser.add_argument(
         "--port",

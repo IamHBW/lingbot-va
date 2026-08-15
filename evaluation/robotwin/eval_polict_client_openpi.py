@@ -1,12 +1,16 @@
 import sys
 import os
 import subprocess
+import ast
+import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path(os.environ.get("ROBOTWIN_ROOT", "")).expanduser().resolve()
+if not os.environ.get("ROBOTWIN_ROOT") or not robowin_root.is_dir():
+    raise RuntimeError("ROBOTWIN_ROOT must point to the compatible RoboTwin checkout")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -42,6 +46,7 @@ from pathlib import Path
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
+from evaluation.robotwin.eval_protocol import START_SEED
 
 def write_json(data: dict, fpath: Path) -> None:
     """Write data to a JSON file.
@@ -55,6 +60,13 @@ def write_json(data: dict, fpath: Path) -> None:
     fpath.parent.mkdir(exist_ok=True, parents=True)
     with open(fpath, "w") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def append_jsonl(data: dict, fpath: Path) -> None:
+    fpath.parent.mkdir(exist_ok=True, parents=True)
+    with open(fpath, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(data, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
 
 def add_title_bar(img, text, font_scale=0.8, thickness=2):
     """Add a black title bar with text above the image"""
@@ -305,13 +317,16 @@ def main(usr_args):
     policy_name = usr_args["policy_name"]
     video_guidance_scale = usr_args["video_guidance_scale"]
     action_guidance_scale = usr_args["action_guidance_scale"]
-    instruction_type = 'seen'
+    instruction_type = usr_args["instruction_type"]
     save_dir = None
     video_save_dir = None
     video_size = None
 
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+    # The protocol keeps only the first success and first failure comparison video.
+    args["eval_video_log"] = False
 
     args['task_name'] = task_name
     args["task_config"] = task_config
@@ -357,7 +372,7 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    save_dir = Path(save_root) / "metrics" / task_name
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if args["eval_video_log"]:
@@ -392,12 +407,12 @@ def main(usr_args):
 
     seed = usr_args["seed"]
 
-    st_seed = 10000 * (1 + seed)
+    st_seed = usr_args["start_seed"]
     suc_nums = []
     test_num = usr_args["test_num"]
 
     
-    model = WebsocketClientPolicy(port=usr_args['port'])
+    model = WebsocketClientPolicy(host=usr_args["host"], port=usr_args['port'])
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -409,7 +424,12 @@ def main(usr_args):
                                    instruction_type=instruction_type,
                                    save_visualization=True,
                                    video_guidance_scale=video_guidance_scale,
-                                   action_guidance_scale=action_guidance_scale)
+                                   action_guidance_scale=action_guidance_scale,
+                                   phase=usr_args["phase"],
+                                   results_path=Path(usr_args["results_detailed"]),
+                                   exclusions_path=Path(usr_args["exclusions"]),
+                                   save_sample_videos=usr_args["save_sample_videos"],
+                                   sample_video_root=Path(usr_args["sample_video_root"]))
     suc_nums.append(suc_num)
 
     file_path = os.path.join(save_dir, f"_result.txt")
@@ -451,7 +471,12 @@ def eval_policy(task_name,
                 instruction_type=None,
                 save_visualization=False,
                 video_guidance_scale=5.0,
-                action_guidance_scale=5.0):
+                action_guidance_scale=5.0,
+                phase="clean",
+                results_path=None,
+                exclusions_path=None,
+                save_sample_videos=True,
+                sample_video_root=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -480,11 +505,15 @@ def eval_policy(task_name,
                 TASK_ENV.close_env()
             except UnStableError as e:
                 TASK_ENV.close_env()
+                append_jsonl({"task": task_name, "phase": phase, "seed": now_seed,
+                              "status": "expert_unstable", "error": str(e)}, exclusions_path)
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
                 TASK_ENV.close_env()
+                append_jsonl({"task": task_name, "phase": phase, "seed": now_seed,
+                              "status": "expert_error", "error": repr(e)}, exclusions_path)
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print(f"error occurs ! {e}")
@@ -495,6 +524,8 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
+            append_jsonl({"task": task_name, "phase": phase, "seed": now_seed,
+                          "status": "expert_infeasible", "error": None}, exclusions_path)
             now_seed += 1
             args["render_freq"] = render_freq
             continue
@@ -537,6 +568,7 @@ def eval_policy(task_name,
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
 
         succ = False
+        rollout_started = time.monotonic()
 
         prompt = TASK_ENV.get_instruction()
         ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
@@ -612,17 +644,22 @@ def eval_policy(task_name,
                 break
       
 
-        vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
-        out_img_file = vis_dir / video_name
-        save_comparison_video(
-            real_obs_list=full_obs_list,
-            imagined_video=None, #gen_video_list,
-            action_history=full_action_history,
-            save_path=str(out_img_file),
-            fps=15 # Suggest adjusting fps based on simulation step
-        )
+        if save_sample_videos:
+            outcome = "success" if succ else "failure"
+            claim = sample_video_root / f".{outcome}.claim"
+            try:
+                claim.mkdir(parents=True)
+            except FileExistsError:
+                pass
+            else:
+                sample_video_root.mkdir(parents=True, exist_ok=True)
+                save_comparison_video(
+                    real_obs_list=full_obs_list,
+                    imagined_video=None,
+                    action_history=full_action_history,
+                    save_path=str(sample_video_root / f"first_{outcome}.mp4"),
+                    fps=15,
+                )
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
@@ -639,6 +676,18 @@ def eval_policy(task_name,
             TASK_ENV.viewer.close()
 
         TASK_ENV.test_num += 1
+
+        append_jsonl({
+            "task": task_name,
+            "phase": phase,
+            "episode_index": TASK_ENV.test_num - 1,
+            "seed": now_seed,
+            "instruction": prompt,
+            "success": bool(succ),
+            "elapsed_seconds": time.monotonic() - rollout_started,
+            "status": "finished",
+            "error": None,
+        }, results_path)
 
         save_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'metrics' / task_name
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -660,17 +709,56 @@ def eval_policy(task_name,
 
 def parse_args_and_config():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--config", type=str)
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
+    parser.add_argument("--task-name")
+    parser.add_argument("--task-config", choices=("demo_clean", "demo_randomized"))
+    parser.add_argument("--policy-name", default="ACT")
+    parser.add_argument("--ckpt-setting", default="step-30000")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000, help='remote policy socket port.')
     parser.add_argument("--save_root", type=str, default="results/default_vis_path")
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
-    parser.add_argument("--action_guidance_scale", type=float, default=5.0)
+    parser.add_argument("--action_guidance_scale", type=float, default=1.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--instruction-type", choices=("seen", "unseen"), default="unseen")
+    parser.add_argument("--start-seed", type=int, default=START_SEED)
+    parser.add_argument("--phase", choices=("clean", "randomized"), default="clean")
+    parser.add_argument("--results-detailed")
+    parser.add_argument("--exclusions")
+    parser.add_argument("--save-sample-videos", action="store_true")
+    parser.add_argument("--sample-video-root")
     args = parser.parse_args()
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+    else:
+        config = {}
+
+    direct = {
+        "task_name": args.task_name,
+        "task_config": args.task_config,
+        "policy_name": args.policy_name,
+        "ckpt_setting": args.ckpt_setting,
+        "host": args.host,
+        "port": args.port,
+        "save_root": args.save_root,
+        "video_guidance_scale": args.video_guidance_scale,
+        "action_guidance_scale": args.action_guidance_scale,
+        "test_num": args.test_num,
+        "instruction_type": args.instruction_type,
+        "start_seed": args.start_seed,
+        "phase": args.phase,
+        "results_detailed": args.results_detailed or str(Path(args.save_root) / "results_detailed.jsonl"),
+        "exclusions": args.exclusions or str(Path(args.save_root) / "exclusions.jsonl"),
+        "save_sample_videos": args.save_sample_videos,
+        "sample_video_root": args.sample_video_root or str(Path(args.save_root) / "sample_videos"),
+        "seed": 0,
+        "train_config_name": 0,
+        "model_name": 0,
+    }
+    config.update({key: value for key, value in direct.items() if value is not None})
 
     # Parse overrides
     def parse_override_pairs(pairs):
@@ -679,8 +767,8 @@ def parse_args_and_config():
             key = pairs[i].lstrip("--")
             value = pairs[i + 1]
             try:
-                value = eval(value)
-            except:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 pass
             override_dict[key] = value
         return override_dict
@@ -688,6 +776,9 @@ def parse_args_and_config():
     if args.overrides:
         overrides = parse_override_pairs(args.overrides)
         config.update(overrides)
+
+    if not config.get("task_name") or not config.get("task_config"):
+        parser.error("task name and task config are required")
 
     return config
 
@@ -697,4 +788,3 @@ if __name__ == "__main__":
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
-
